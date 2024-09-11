@@ -1,110 +1,57 @@
 'use client';
 
-import { useState, useEffect, useRef, MouseEvent } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { DataPacket_Kind, Room, Participant } from 'livekit-client';
-
-// Define the props for the Whiteboard component
-interface WhiteboardProps {
-  room: Room | null;
-}
-
-// Define the state for cursor position
-interface CursorPos {
-  x: number;
-  y: number;
-}
-
-// Define the state for the history of canvas states
-interface CanvasState {
-  image: string; // Data URL of the canvas state
-}
-
-// Define the state for the Whiteboard component
-interface WhiteboardState {
-  isDrawing: boolean;
-  participants: Participant[];
-  error: string | null;
-  history: CanvasState[];
-  redoHistory: CanvasState[];
-  lineWidth: number;
-  lineColor: string;
-  zoom: number;
-  cursorPos: CursorPos;
-}
-
-// Define the data structure for drawing commands
-interface DrawingData {
-  offsetX: number;
-  offsetY: number;
-  type: 'drawing';
-  color: string;
-  width: number;
-}
-
-// Define the data structure for clear canvas commands
-interface ClearData {
-  type: 'clear';
-}
-
-// Define the types of data that can be sent over the network
-type DrawingDataPacket = DrawingData | ClearData;
-
+import { Stage, Layer, Line } from 'react-konva';
+import Konva from 'konva';
 
 interface WhiteboardProps {
   room: Room | null;
 }
 
 const Whiteboard: React.FC<WhiteboardProps> = ({ room }) => {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const contextRef = useRef<CanvasRenderingContext2D | null>(null);
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
+  const [lines, setLines] = useState<any[]>([]);
+  const [tool, setTool] = useState<string>('brush');
+  const [color, setColor] = useState<string>('#df4b26');
+  const [lineWidth, setLineWidth] = useState<number>(5);
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [history, setHistory] = useState<any[][]>([]);
+  const [redoStack, setRedoStack] = useState<any[][]>([]);
+  const [zoom, setZoom] = useState<number>(1);
+  const [pan, setPan] = useState<Konva.Vector2d>({ x: 0, y: 0 });
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-
-  const [history, setHistory] = useState<string[]>([]);
-  const [redoHistory, setRedoHistory] = useState<string[]>([]);
-  const [lineWidth, setLineWidth] = useState<number>(5);
-  const [lineColor, setLineColor] = useState<string>('black');
-  const [zoom, setZoom] = useState<number>(1);
-  const [cursorPos, setCursorPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const stageRef = useRef<Konva.Stage>(null);
 
   useEffect(() => {
-    if (!room) {
-      setError('Room is not available.');
-      return;
-    }
+    if (!room) return;
 
     room.once('connected', () => {
-      console.log('Room connected.');
-
-      if (room.participants && Object.keys(room.participants).length > 0) {
-        setParticipants(Object.values(room.participants));
-      } else {
-        console.warn('No participants available yet.');
-      }
+      setParticipants(Object.values(room.localParticipant || {}));
     });
 
     room.on('dataReceived', (data, participant) => {
-      console.log('Data received from participant:', participant.identity);
       const decodedData = decoder.decode(data);
-      console.log('Decoded data:', decodedData);
-
       try {
-        if (decodedData) {
-          const parsedData = JSON.parse(decodedData);
-          const { offsetX, offsetY, type, color, width } = parsedData;
-          if (type === 'drawing') {
-            drawFromRemote(offsetX, offsetY, color, width);
-          } else if (type === 'clear') {
-            clearCanvasRemote();
-          }
-        } else {
-          console.warn('Received empty data from participant:', participant.identity);
+        const parsedData = JSON.parse(decodedData);
+        const { type, points, stroke, strokeWidth } = parsedData;
+
+        if (type === 'drawing') {
+          const newLine = {
+            points,
+            stroke,
+            strokeWidth,
+            globalCompositeOperation: tool === 'brush' ? 'source-over' : 'destination-out',
+            lineCap: 'round',
+            lineJoin: 'round',
+          };
+          setLines((prevLines) => [...prevLines, newLine]);
+        } else if (type === 'clear') {
+          setLines([]);
         }
       } catch (error) {
-        console.error('Error parsing data from participant:', participant.identity, error);
+        console.error('Error parsing data:', error);
       }
     });
 
@@ -123,198 +70,185 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room }) => {
     };
   }, [room]);
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext('2d');
-    if (context) {
-      context.lineCap = 'round';
-      context.strokeStyle = lineColor;
-      context.lineWidth = lineWidth;
-      contextRef.current = context;
-    }
-  }, [lineColor, lineWidth]);
-
-  const startDrawing = (event: MouseEvent<HTMLCanvasElement>) => {
-    const { offsetX, offsetY } = event.nativeEvent;
-    const context = contextRef.current;
-    if (context) {
-      context.beginPath();
-      context.moveTo(offsetX / zoom, offsetY / zoom);
+  const handleMouseDown = (e: Konva.KonvaEventObject<MouseEvent>) => {
+    const pos = e.target.getStage()?.getPointerPosition();
+    if (pos) {
       setIsDrawing(true);
-    }
-  };
+      const newLine = {
+        points: [pos.x, pos.y, pos.x, pos.y],
+        stroke: color,
+        strokeWidth: lineWidth,
+        globalCompositeOperation: tool === 'brush' ? 'source-over' : 'destination-out',
+        lineCap: 'round',
+        lineJoin: 'round',
+      };
+      setLines((prevLines) => [...prevLines, newLine]);
 
-  const finishDrawing = () => {
-    const context = contextRef.current;
-    if (context) {
-      context.closePath();
-      setIsDrawing(false);
-      const image = canvasRef.current?.toDataURL();
-      if (image) {
-        setHistory((prevHistory) => [...prevHistory, image]);
-        setRedoHistory([]);
-      }
-    }
-  };
-
-  const draw = (event: MouseEvent<HTMLCanvasElement>) => {
-    if (!isDrawing) return;
-    const { offsetX, offsetY } = event.nativeEvent;
-    const context = contextRef.current;
-    if (context) {
-      context.lineTo(offsetX / zoom, offsetY / zoom);
-      context.stroke();
-
+      // Send drawing data to other participants
       if (room && room.localParticipant) {
         const dataToSend = JSON.stringify({
-          offsetX: offsetX / zoom,
-          offsetY: offsetY / zoom,
           type: 'drawing',
-          color: lineColor,
-          width: lineWidth,
+          points: newLine.points,
+          stroke: newLine.stroke,
+          strokeWidth: newLine.strokeWidth,
         });
         const data = encoder.encode(dataToSend);
-
-        if (data && data.length > 0) {
-          room.localParticipant.publishData(data, DataPacket_Kind.LOSSY);
-        }
+        room.localParticipant.publishData(data, DataPacket_Kind.LOSSY);
       }
     }
   };
 
-  const drawFromRemote = (offsetX: number, offsetY: number, color: string, width: number) => {
-    const context = contextRef.current;
-    if (context) {
-      context.strokeStyle = color;
-      context.lineWidth = width;
-      context.lineTo(offsetX * zoom, offsetY * zoom);
-      context.stroke();
+  const handleMouseMove = (e: Konva.KonvaEventObject<MouseEvent>) => {
+    if (!isDrawing) return;
+    const pos = e.target.getStage()?.getPointerPosition();
+    if (pos) {
+      const updatedLines = [...lines];
+      const currentLine = updatedLines[updatedLines.length - 1];
+      currentLine.points = [...currentLine.points, pos.x, pos.y];
+      setLines(updatedLines);
+
+      // Send drawing data to other participants
+      if (room && room.localParticipant) {
+        const dataToSend = JSON.stringify({
+          type: 'drawing',
+          points: currentLine.points,
+          stroke: currentLine.stroke,
+          strokeWidth: currentLine.strokeWidth,
+        });
+        const data = encoder.encode(dataToSend);
+        room.localParticipant.publishData(data, DataPacket_Kind.LOSSY);
+      }
     }
   };
 
-  const clearCanvas = () => {
+  const handleMouseUp = () => {
+    setIsDrawing(false);
+    saveToHistory();
+  };
+
+  const handleClear = () => {
     if (room && room.localParticipant) {
       const clearCommand = JSON.stringify({ type: 'clear' });
       const data = encoder.encode(clearCommand);
-
       room.localParticipant.publishData(data, DataPacket_Kind.RELIABLE);
     }
-
-    const context = contextRef.current;
-    if (context) {
-      context.clearRect(0, 0, canvasRef.current?.width || 0, canvasRef.current?.height || 0);
-    }
-    setHistory([]);
-    setRedoHistory([]);
+    setLines([]);
+    saveToHistory();
   };
 
-  const clearCanvasRemote = () => {
-    const context = contextRef.current;
-    if (context) {
-      context.clearRect(0, 0, canvasRef.current?.width || 0, canvasRef.current?.height || 0);
-    }
+  const saveToHistory = () => {
+    setHistory((prevHistory) => [...prevHistory, lines]);
+    setRedoStack([]);
   };
 
   const undo = () => {
-    if (history.length > 0) {
-      const previousState = history.pop();
-      if (previousState) {
-        setRedoHistory((prevRedoHistory) => [...prevRedoHistory, canvasRef.current?.toDataURL() || '']);
-        const img = new Image();
-        img.src = previousState;
-        img.onload = () => {
-          const context = contextRef.current;
-          if (context) {
-            context.clearRect(0, 0, canvasRef.current?.width || 0, canvasRef.current?.height || 0);
-            context.drawImage(img, 0, 0);
-          }
-        };
-        setHistory(history);
-      }
-    }
+    const lastState = history.slice(-1)[0];
+    setRedoStack((prevRedoStack) => [...prevRedoStack, lines]);
+    setLines(lastState || []);
+    setHistory((prevHistory) => prevHistory.slice(0, -1));
   };
 
   const redo = () => {
-    if (redoHistory.length > 0) {
-      const redoState = redoHistory.pop();
-      if (redoState) {
-        setHistory((prevHistory) => [...prevHistory, canvasRef.current?.toDataURL() || '']);
-        const img = new Image();
-        img.src = redoState;
-        img.onload = () => {
-          const context = contextRef.current;
-          if (context) {
-            context.clearRect(0, 0, canvasRef.current?.width || 0, canvasRef.current?.height || 0);
-            context.drawImage(img, 0, 0);
-          }
-        };
-        setRedoHistory(redoHistory);
-      }
+    const lastRedo = redoStack.slice(-1)[0];
+    setLines(lastRedo || []);
+    setRedoStack((prevRedoStack) => prevRedoStack.slice(0, -1));
+  };
+
+  const handleZoomIn = () => {
+    setZoom((prevZoom) => Math.min(prevZoom + 0.1, 2));
+  };
+
+  const handleZoomOut = () => {
+    setZoom((prevZoom) => Math.max(prevZoom - 0.1, 0.1));
+  };
+
+  const handlePan = (e: Konva.KonvaEventObject<WheelEvent>) => {
+    if (stageRef.current) {
+      const { x, y } = stageRef.current.getAttrs();
+      setPan({ x: x - e.evt.deltaX / zoom, y: y - e.evt.deltaY / zoom });
+      stageRef.current.position({ x: x - e.evt.deltaX / zoom, y: y - e.evt.deltaY / zoom });
     }
   };
 
-  const zoomIn = () => {
-    setZoom((prevZoom) => Math.min(prevZoom * 1.1, 3));
-  };
+  const handleSaveSession = () => {
+    const sessionData = JSON.stringify({ lines });
+    localStorage.setItem('whiteboardSession', sessionData);
+  };  
 
-  const zoomOut = () => {
-    setZoom((prevZoom) => Math.max(prevZoom / 1.1, 0.5));
+  const handleLoadSession = () => {
+    const sessionData = localStorage.getItem('whiteboardSession');
+    if (sessionData) {
+      const { lines } = JSON.parse(sessionData);
+      setLines(lines);
+    }
   };
+  
 
   return (
     <div className="relative">
-      {error && <p className="text-red-500">{error}</p>}
-      <div className="flex space-x-2 m-4">
+      <div className="flex max-w-screen-xl max-h-screen space-x-2 m-4">
+        <button onClick={handleClear} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Clear</button>
         <button onClick={undo} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Undo</button>
         <button onClick={redo} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Redo</button>
-        <button onClick={clearCanvas} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Clear</button>
-        <button onClick={zoomIn} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Zoom In</button>
-        <button onClick={zoomOut} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Zoom Out</button>
+        <button onClick={handleZoomIn} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Zoom In</button>
+        <button onClick={handleZoomOut} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Zoom Out</button>
+        <button onClick={handleSaveSession} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Save Session</button>
+        <button onClick={handleLoadSession} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">Load Session</button>
+        <select
+          title='select'
+          value={tool}
+          onChange={(e) => setTool(e.target.value)}
+          className="m-2"
+        >
+          <option value="brush">Brush</option>
+          <option value="eraser">Eraser</option>
+        </select>
         <input
           title='input'
           type="color"
-          value={lineColor}
-          onChange={(e) => setLineColor(e.target.value)}
-          className="ml-2"
+          value={color}
+          onChange={(e) => setColor(e.target.value)}
+          className="m-2"
         />
-        <label className="ml-2">
+        <label className="m-2">
           Line Width
           <input
             type="range"
             min="1"
             max="50"
             value={lineWidth}
-            onChange={(e) => setLineWidth(parseInt(e.target.value, 10))}
+            onChange={(e) => setLineWidth(Number(e.target.value))}
             className="ml-2"
           />
         </label>
       </div>
-      <canvas
-        ref={canvasRef}
-        onMouseDown={startDrawing}
-        onMouseUp={finishDrawing}
-        onMouseMove={draw}
-        width={800}
-        height={600}
-        className="border border-black"
-        style={{
-          transform: `scale(${zoom})`,
-          transformOrigin: 'top left',
-        }}
-      />
-      <div
-        className="absolute"
-        style={{
-          top: `${cursorPos.y}px`,
-          left: `${cursorPos.x}px`,
-          width: `${lineWidth}px`,
-          height: `${lineWidth}px`,
-          backgroundColor: lineColor,
-          borderRadius: '50%',
-          transform: 'translate(-50%, -50%)',
-          pointerEvents: 'none'
-        }}
-      />
+      <Stage
+        width={window.innerWidth}
+        height={window.innerHeight}
+        ref={stageRef}
+        scaleX={zoom}
+        scaleY={zoom}
+        x={pan.x}
+        y={pan.y}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onWheel={handlePan}
+      >
+        <Layer>
+          {lines.map((line, i) => (
+            <Line
+              key={i}
+              points={line.points}
+              stroke={line.stroke}
+              strokeWidth={line.strokeWidth}
+              globalCompositeOperation={line.globalCompositeOperation}
+              lineCap={line.lineCap}
+              lineJoin={line.lineJoin}
+            />
+          ))}
+        </Layer>
+      </Stage>
       <div>
         <h3 className="text-xl font-bold">Participants</h3>
         <ul>
